@@ -22,12 +22,18 @@ class Browser:
         ensure_daemon()
         # Target.createTarget then attachToTarget is two separate round trips; the freshly
         # created background target can occasionally be gone by the second one ("No target
-        # with given id found"). Retry the whole create+attach pair a few times before giving up.
+        # with given id found"). The same -32602 error can also hit the immediately-following
+        # setup calls (setDeviceMetricsOverride, Page.navigate) if the session goes stale
+        # before they execute. Retry the entire create+attach+setup sequence as a unit.
         last_error = None
         for attempt in range(6):
             self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
             try:
                 self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+                self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+                # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
+                self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+                self.call("Page.navigate", url=url)
                 last_error = None
                 break
             except RuntimeError as error:
@@ -43,10 +49,6 @@ class Browser:
                 "Could not open a Chrome tab. Make sure Chrome is running and connected "
                 "(run: uv run browser-harness --doctor)."
             ) from last_error
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
-        # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
-        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if self.evaluate("document.readyState") == "complete":
