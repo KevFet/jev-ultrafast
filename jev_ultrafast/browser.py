@@ -27,8 +27,8 @@ class Browser:
         # before they execute. Retry the entire create+attach+setup sequence as a unit.
         last_error = None
         for attempt in range(6):
-            self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
             try:
+                self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
                 self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
                 self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
                 # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
@@ -39,7 +39,7 @@ class Browser:
             except RuntimeError as error:
                 last_error = error
                 try:
-                    cdp("Target.closeTarget", targetId=self.target)
+                    cdp("Target.closeTarget", targetId=getattr(self, "target", None) or "")
                 except RuntimeError:
                     pass
                 if attempt < 5:
@@ -162,7 +162,10 @@ class Browser:
 
     def close(self):
         if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
+            try:
+                cdp("Target.closeTarget", targetId=self.target)
+            except RuntimeError:
+                pass
             self.target = None
 
 
