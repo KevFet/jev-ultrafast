@@ -20,8 +20,29 @@ class StalePage(ValueError):
 class Browser:
     def __init__(self, url):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-        self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        # Target.createTarget then attachToTarget is two separate round trips; the freshly
+        # created background target can occasionally be gone by the second one ("No target
+        # with given id found"). Retry the whole create+attach pair a few times before giving up.
+        last_error = None
+        for attempt in range(6):
+            self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+            try:
+                self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+                last_error = None
+                break
+            except RuntimeError as error:
+                last_error = error
+                try:
+                    cdp("Target.closeTarget", targetId=self.target)
+                except RuntimeError:
+                    pass
+                if attempt < 5:
+                    time.sleep(0.1 * 2**attempt)  # 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
+        if last_error is not None:
+            raise RuntimeError(
+                "Could not open a Chrome tab. Make sure Chrome is running and connected "
+                "(run: uv run browser-harness --doctor)."
+            ) from last_error
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
@@ -36,7 +57,9 @@ class Browser:
         return cdp(method, session_id=self.session, **params)
 
     def evaluate(self, expression):
-        response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
+        response = self.call(
+            "Runtime.evaluate", expression=expression, returnByValue=True, _response_timeout=20
+        )
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
@@ -50,7 +73,10 @@ class Browser:
                     "Runtime.evaluate",
                     expression="""(action => new Promise(resolve => {
                       const field=window.__jevFast?.nodes.get(action.node);
-                      const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
+                      const autocomplete=action.kind==='fill' && !!(field?.getAttribute('role')==='combobox' ||
+                        field?.getAttribute('aria-autocomplete') ||
+                        field?.getAttribute('aria-controls') ||
+                        field?.getAttribute('aria-owns'));
                       let frames=0, stopped=false;
                       const finish=()=>{stopped=true;resolve()};
                       setTimeout(finish,autocomplete ? 200 : 50);
@@ -71,9 +97,22 @@ class Browser:
                     }))(""" + json.dumps(action) + ")",
                     awaitPromise=True,
                     returnByValue=True,
+                    _response_timeout=20,
                 )
             except RuntimeError:
                 pass
+        # A same-target navigation to a new origin (e.g. a search submit that leaves the page for a
+        # results site) can briefly invalidate the execution context, the same way the initial
+        # Page.navigate in __init__ does. Wait for the document to settle again before reading it;
+        # on the common case (no full navigation happened) this returns immediately.
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    break
+            except StalePage:
+                pass
+            time.sleep(0.05)
         for attempt in range(10):
             try:
                 return browser_operation(
@@ -125,7 +164,9 @@ def browser_operation(request):
         return cdp(method, session_id=session, **params)
 
     def evaluate(expression):
-        result = call("Runtime.evaluate", expression=expression, returnByValue=True)
+        # A full-page snapshot walk (READ_STATE) can be slow on a heavy page that just loaded
+        # (e.g. a results page still fetching/rendering), past the 5s default IPC timeout.
+        result = call("Runtime.evaluate", expression=expression, returnByValue=True, _response_timeout=20)
         if result.get("exceptionDetails"):
             if operation == "act" and request["action"]["kind"] == "select":
                 raise RuntimeError("Dropdown execution was interrupted; inspect before retrying.")
@@ -165,7 +206,17 @@ def browser_operation(request):
             if kind != "select":
                 x, y = target["x"], target["y"]
                 for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+                    # A heavy page (e.g. a results page still loading right after a search submit)
+                    # can leave the renderer too busy to ack a CDP command within the 5s IPC default.
+                    call(
+                        "Input.dispatchMouseEvent",
+                        type=event,
+                        x=x,
+                        y=y,
+                        button="left",
+                        clickCount=1,
+                        _response_timeout=20,
+                    )
                 if kind == "fill":
                     call(
                         "Input.dispatchKeyEvent",
