@@ -77,20 +77,33 @@ class Browser:
                         field?.getAttribute('aria-autocomplete') ||
                         field?.getAttribute('aria-controls') ||
                         field?.getAttribute('aria-owns'));
+                      // A click on an opener (aria-expanded=false or aria-haspopup) waits up to 400 ms
+                      // for a dialog/grid/listbox to appear (e.g. a date-range or autocomplete overlay).
+                      const opener=action.kind==='click' && !!(field?.getAttribute('aria-haspopup') ||
+                        field?.getAttribute('aria-expanded')==='false');
+                      // A click inside an already-open calendar waits 200 ms so an auto-advancing picker
+                      // (e.g. Google Flights opening the return-date view after a departure click) can render.
+                      const inCalendar=!opener && action.kind==='click' &&
+                        !!field?.closest('[role="grid"],[role="dialog"]');
                       let frames=0, stopped=false;
                       const finish=()=>{stopped=true;resolve()};
-                      setTimeout(finish,autocomplete ? 200 : 50);
+                      setTimeout(finish,autocomplete ? 200 : opener ? 400 : inCalendar ? 200 : 50);
+                      const check=e=>{const r=e.getBoundingClientRect();
+                        return r.width && r.height && r.bottom>0 && r.top<innerHeight &&
+                          e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});};
                       const ready=()=>{
                         if (stopped) return;
                         const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
                           .split(/\\s+/).filter(Boolean);
                         const roots=ids.length ? ids.map(id=>document.getElementById(id)).filter(Boolean) : [document];
                         const options=roots.flatMap(root=>[...root.querySelectorAll('[role="option"]')]);
-                        if (++frames>=2 && (!autocomplete || options.some(e=>{
-                          const r=e.getBoundingClientRect();
-                          return r.width && r.height && r.bottom>0 && r.top<innerHeight &&
-                            e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
-                        }))) finish();
+                        const overlays=opener ?
+                          [...document.querySelectorAll('[role="dialog"],[role="grid"],[role="listbox"]')] : [];
+                        if (++frames>=2 && (
+                          (!autocomplete && !opener && !inCalendar) ||
+                          (autocomplete && options.some(check)) ||
+                          (opener && overlays.some(check))
+                        )) finish();
                         else requestAnimationFrame(ready);
                       };
                       requestAnimationFrame(ready);
